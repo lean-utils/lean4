@@ -135,6 +135,16 @@ structure BVDecideConfig where
   eprProjections : Bool := true
 
 /--
+Configuration for the `epr` tactic.
+-/
+structure EprConfig extends BVDecideConfig where
+  structures := false
+  fixedInt := false
+  enums := false
+  uf := true
+  epr := true
+
+/--
 Whether this configuration requires the solver to use incremental solving.
 -/
 def BVDecideConfig.needsIncremental (cfg : BVDecideConfig) : Bool :=

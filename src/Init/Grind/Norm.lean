@@ -30,6 +30,7 @@ theorem eq_false_eq (p : Prop) : (p = False) = ¬p := by simp
 theorem not_eq_prop (p q : Prop) : (¬(p = q)) = (p = ¬q) := by
   by_cases p <;> by_cases q <;> simp [*]
 
+
 theorem true_imp_eq (p : Prop) : (True → p) = p := by simp
 theorem false_imp_eq (p : Prop) : (False → p) = True := by simp
 theorem imp_false_eq (p : Prop) : (p → False) = ¬p := by simp
