@@ -242,16 +242,30 @@ def parseMethod : Parser Method := do
     else fail "invalid method"
 
 /--
-Parses a request-target URI, up to `limits.maxUriLength` bytes.
-Fails with `"uri too long"` if the target exceeds the configured limit.
+Checks if a byte may appear in a request-target: a URI character of RFC 3986 §2 other than `#`,
+since a request-target carries no fragment (RFC 9112 §3.2). Every byte that
+`URI.Parser.parseRequestTarget` accepts satisfies it.
+-/
+@[inline]
+def isRequestTargetByte (c : UInt8) : Bool :=
+  isPChar c || c == '/'.toUInt8 || c == '?'.toUInt8 || c == '%'.toUInt8 ||
+  c == '['.toUInt8 || c == ']'.toUInt8
+
+/--
+Parses a request-target URI, up to `limits.maxUriLength` bytes, and checks that the space that ends
+it follows. Fails with `"uri too long"` if the target exceeds the configured limit, and with
+`"invalid request-target"` at the first byte that neither continues the target nor ends it, so a
+line such as `GET /x\r\n` is rejected as soon as its `CR` arrives instead of waiting for a space.
 -/
 def parseURI (limits : H1.Config) : Parser ByteArray := do
-  let uri ← takeUntilUpTo (· == ' '.toUInt8) limits.maxUriLength
-  if uri.size == limits.maxUriLength then
-    if (← peekWhen? (· != ' '.toUInt8)) |>.isSome then
-      fail "uri too long"
-
-  return uri.toByteArray
+  let uri ← takeWhileUpTo isRequestTargetByte limits.maxUriLength
+  let next ← peek!
+  if next == ' '.toUInt8 then
+    return uri.toByteArray
+  else if uri.size == limits.maxUriLength && isRequestTargetByte next then
+    fail "uri too long"
+  else
+    fail "invalid request-target"
 
 /--
 The URI limits for a request-target. `maxUriLength` bounds the whole target, so no component limit
