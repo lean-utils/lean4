@@ -27,8 +27,10 @@ EOF
 # Test the warning is not printed on a regular build.
 # The configurations use `globs = []` to minimize build variance,
 # and to verify that empty globs do not count as no jobs.
+# The jobs are the package's and the library's `extraDep`, which run before the
+# library's modules are listed, and the library's default facet.
 test_out_diff <(cat << 'EOF'
-Build completed successfully (1 job).
+Build completed successfully (3 jobs).
 EOF
 ) -f $cfg_file build Lib
 }
