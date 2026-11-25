@@ -172,37 +172,93 @@ static bool never_freed(lean_object * o) {
     return c == 0 || (c < 0 && (unsigned)c <= (unsigned)LEAN_RC_STICKY_DROP);
 }
 
+/* Never called: the closure of an unforced thunk only has to hold its argument. */
+static lean_object * unforced_fn(lean_object * a, lean_object * unit) {
+    (void)unit;
+    return a;
+}
+
+/* The kinds of object the walk of `lean_mark_persistent` enters, each holding `child`. */
+static lean_object * wrap_ctor(lean_object * child) { return box1(child); }
+static lean_object * wrap_forced_thunk(lean_object * child) { return lean_thunk_pure(child); }
+static lean_object * wrap_unforced_thunk(lean_object * child) {
+    lean_object * c = lean_alloc_closure((void *)unforced_fn, 2, 1);
+    lean_closure_set(c, 0, child);
+    return lean_mk_thunk(c);
+}
+static lean_object * wrap_ref(lean_object * child) { return lean_st_mk_ref(child); }
+static lean_object * wrap_task(lean_object * child) { return lean_task_pure(child); }
+
+static lean_object * (* const g_wraps[])(lean_object *) = {
+    wrap_ctor, wrap_forced_thunk, wrap_unforced_thunk, wrap_ref, wrap_task,
+};
+static char const * const g_wrap_names[] = {"constructor", "forced thunk", "unforced thunk", "Ref", "task"};
+#define NUM_WRAPS (sizeof(g_wraps) / sizeof(g_wraps[0]))
+
+#define CHECK_KIND(c, w) do { \
+    if (!(c)) { printf("%s:%d: check failed for a %s: %s\n", __FILE__, __LINE__, g_wrap_names[w], #c); \
+                g_failures++; } \
+} while (0)
+
+static const uint8_t g_wrap_tags[] = {0, LeanThunk, LeanThunk, LeanRef, LeanTask};
+
+/* An object of kind `w` that other threads hold (count -2), around a thread-shared leaf it owns. */
+static lean_object * shared_node(size_t w, lean_object ** inner) {
+    *inner = leaf(-1);
+    lean_object * o = g_wraps[w](*inner);
+    CHECK_KIND(lean_ptr_tag(o) == g_wrap_tags[w], w);
+    lean_internal_set_rc(o, -2);
+    return o;
+}
+
 /* `lean_mark_persistent` on objects other threads hold, as `lean_obj_once_cold` does when a closed
    term's value was already shared before the term was first read: a thread-shared root, and a
-   thread-shared child of a single-threaded parent. An adjustment whose check passed before the
-   marking applies its atomic update after it; a plain store of 0 turned that into a count of 1 or -1,
-   which the next drop freed while the object was still referenced. */
+   thread-shared child of a single-threaded parent, of every kind the walk enters (a spawned task is
+   always thread-shared). An adjustment whose check passed before the marking applies its
+   atomic update after it; a plain store of 0 turned that into a count of 1 or -1, which the next drop
+   freed while the object was still referenced. The walk stops at such an object: what it points to
+   stays alive through it, and is not read while other threads may update it (a thunk being forced, a
+   `Ref` being set) or waited for (a running task). */
 static void test_mark_persistent_shared(void) {
-    for (int late_drop = 0; late_drop < 2; late_drop++) {
-        lean_object * grandchild = leaf(-1);
-        lean_object * root = box1(grandchild);
-        lean_internal_set_rc(root, -2);
-        lean_object * child = leaf(-2);
-        lean_object * parent = box1(child);
-        lean_mark_persistent(root);
-        lean_mark_persistent(parent);
-        CHECK_RC(parent, 0);
-        // The walk stops at a thread-shared object: what it points to stays alive through it.
-        CHECK_RC(grandchild, -1);
-        lean_object * shared[] = {root, child};
-        for (size_t i = 0; i < 2; i++) {
-            lean_object * o = shared[i];
-            if (late_drop) stale_dec(o); else stale_inc(o, LEAN_RC_INC_MAX);
-            CHECK(never_freed(o));
-            if (!never_freed(o)) continue;
-            lean_dec(o);
-            lean_inc(o);
-            lean_dec(o);
-            CHECK(never_freed(o));
+    for (size_t w = 0; w < NUM_WRAPS; w++) {
+        for (int late_drop = 0; late_drop < 2; late_drop++) {
+            lean_object * root_inner, * child_inner;
+            lean_object * root = shared_node(w, &root_inner);
+            lean_object * child = shared_node(w, &child_inner);
+            lean_object * parent = box1(child);
+            lean_mark_persistent(root);
+            lean_mark_persistent(parent);
+            CHECK_KIND(rc(parent) == 0, w);
+            lean_object * shared[] = {root, child};
+            lean_object * inner[] = {root_inner, child_inner};
+            for (size_t i = 0; i < 2; i++) {
+                lean_object * o = shared[i];
+                CHECK_KIND(rc(o) == LEAN_RC_STICKY, w);
+                CHECK_KIND(rc(inner[i]) == -1, w);
+                if (late_drop) stale_dec(o); else stale_inc(o, LEAN_RC_INC_MAX);
+                CHECK_KIND(never_freed(o), w);
+                if (!never_freed(o)) continue;
+                lean_dec(o);
+                lean_inc(o);
+                lean_dec(o);
+                CHECK_KIND(never_freed(o), w);
+            }
+            release(parent);
+            release(child);
+            release(root);
         }
-        release(parent);
-        release(child);
-        release(root);
+    }
+    // A thread-shared count that froze, and one that late increments moved further into the band,
+    // are left where they are; one that late drops moved back above the band's top is lowered to it.
+    static const int frozen[][2] = {
+        {LEAN_RC_STICKY, LEAN_RC_STICKY}, {LEAN_RC_STICKY - 8, LEAN_RC_STICKY - 8},
+        {LEAN_RC_STICKY + 8, LEAN_RC_STICKY},
+    };
+    for (size_t i = 0; i < sizeof(frozen) / sizeof(frozen[0]); i++) {
+        lean_object * o = leaf(frozen[i][0]);
+        lean_mark_persistent(o);
+        CHECK_RC(o, frozen[i][1]);
+        release(o);
     }
     // A single-threaded graph is still marked persistent throughout.
     lean_object * child = leaf(1);

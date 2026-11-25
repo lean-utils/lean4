@@ -602,6 +602,21 @@ static obj_res mark_persistent_fn(obj_arg o) {
 #endif
 #endif
 
+// Keeps LeakSanitizer from reporting a persistent object as a leak. LeakSanitizer treats an ignored
+// object's contents as live, so what it points to is not reported either, whether or not the walk
+// below visits it.
+// NOTE: Most persistent objects are actually reachable from global variables up to the end of the
+// process. However, this is *not* true for closures inside of persistent thunks, which are
+// "orphaned" after being evaluated.
+static inline void lsan_ignore_persistent(object * o) {
+#if defined(__has_feature)
+#if __has_feature(address_sanitizer)
+    __lsan_ignore_object(o);
+#endif
+#endif
+    (void)o;
+}
+
 extern "C" LEAN_EXPORT void lean_mark_persistent(object * o) {
     buffer<object*> todo;
     todo.push_back(o);
@@ -619,21 +634,19 @@ extern "C" LEAN_EXPORT void lean_mark_persistent(object * o) {
                 // What `o` points to stays alive through `o`, which is now never freed, so the walk
                 // stops here rather than read fields other threads may be updating (a thunk being
                 // forced, a `Ref` being set).
-                if (lean_is_unstuck_mt(o))
-                    std::atomic_store_explicit(lean_get_rc_mt_addr(o), LEAN_RC_STICKY, std::memory_order_relaxed);
+                // A count above `LEAN_RC_STICKY` (one increments still adjust, including a frozen one
+                // that late drops moved back above it) is set to it by a compare-and-swap, so that a
+                // count another thread froze, and late increments moved further into the band,
+                // between the load and the swap is left where it is.
+                int rc = std::atomic_load_explicit(lean_get_rc_mt_addr(o), std::memory_order_relaxed);
+                while ((unsigned)rc > (unsigned)LEAN_RC_STICKY &&
+                       !std::atomic_compare_exchange_weak_explicit(lean_get_rc_mt_addr(o), &rc, LEAN_RC_STICKY,
+                                                                   std::memory_order_relaxed, std::memory_order_relaxed)) {}
+                lsan_ignore_persistent(o);
                 continue;
             }
             lean_internal_set_rc(o, 0);
-#if defined(__has_feature)
-#if __has_feature(address_sanitizer)
-            // do not report as leak
-            // NOTE: Most persistent objects are actually reachable from global
-            // variables up to the end of the process. However, this is *not*
-            // true for closures inside of persistent thunks, which are
-            // "orphaned" after being evaluated.
-            __lsan_ignore_object(o);
-#endif
-#endif
+            lsan_ignore_persistent(o);
             uint8_t tag = lean_ptr_tag(o);
             if (tag <= LeanMaxCtorTag) {
                 object ** it  = lean_ctor_obj_cptr(o);
