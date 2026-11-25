@@ -36,6 +36,12 @@ That is, the modules from `getModuleArray` plus their local transitive imports.
 partial def LeanLib.recCollectLocalModules
   (self : LeanLib) : FetchM (Job (Array Module))
 := ensureJob do
+  -- The library's extra target dependencies (e.g., `needs`) may generate one of its modules
+  -- (#16748), so the module files are listed only after they finish. Their failure is reported by
+  -- their own jobs and the module jobs (see `Module.recFetchPreSetup`), not repeated here. A
+  -- `needs` target that fetches this facet of its own library thus forms a dependency cycle (see
+  -- `Module.recParseImports`).
+  discard <| (← self.extraDep.fetch).wait
   let mut col : ModuleCollection := {}
   for mod in (← self.getModuleArray) do
     col ← go mod col (viaImport := false)

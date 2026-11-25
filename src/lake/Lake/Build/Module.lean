@@ -46,8 +46,8 @@ import's IR is loaded (see `Lean.importModulesCore`). When code generation is po
 Build function definitions for a module's builtin facets.
 -/
 
-/-- Read the source of a Lean file and parse its header. -/
-def Module.readInput (mod : Module) : JobM ModuleInput := do
+/-- Parse the header of a Lean file from its source. -/
+def Module.recFetchInput (mod : Module) : FetchM (Job ModuleInput) := Job.async do
   let path := mod.leanFile
   -- Modification must be read before the file. Otherwise, a modifcation between the file read
   -- and the modification time read would not be caught by the check in `buildLean`.
@@ -59,16 +59,6 @@ def Module.readInput (mod : Module) : JobM ModuleInput := do
   let imports ← header.imports.mapM fun imp => do
     return ⟨imp, (← findModule? imp.module)⟩
   return {path, header, imports, trace}
-
-/-- Parse the header of a Lean file from its source. -/
-def Module.recFetchInput (mod : Module) : FetchM (Job ModuleInput) := do
-  -- The library's extra target dependencies (e.g., `needs`) may write the source, so it is read
-  -- only after they finish. This job does not inherit their failure or the build's cancellation;
-  -- `recFetchPreSetup` awaits them again and reports those.
-  let extraDepJob ← mod.lib.extraDep.fetch
-  SpawnM.ofFn fun fetch pkg? stack store ctx _ =>
-    Job.ofTask <$> BaseIO.mapTask (t := extraDepJob.task) fun _ =>
-      (withLoggedIO mod.readInput).toFn fetch pkg? stack store ctx {}
 
 /-- The `ModuleFacetConfig` for the builtin `inputFacet`. -/
 public def Module.inputFacetConfig : ModuleFacetConfig inputFacet :=
@@ -86,12 +76,38 @@ public def Module.headerFacetConfig : ModuleFacetConfig headerFacet :=
 
 /-- Compute an `Array` of a module's direct local imports from its header. -/
 def Module.recParseImports (mod : Module) : FetchM (Job (Array Module)) := do
-  -- A pure projection, so `map` (no cancellation check): the input may finish after a cancellation,
-  -- and module collection must still proceed so that the module jobs report it.
-  return (← mod.input.fetch).map (sync := true) fun input =>
-    let mods := input.imports.foldl (init := OrdModuleSet.empty) fun set imp =>
-      match imp.module? with | some mod => set.insert mod | none => set
-    mods.toArray
+  /-
+  Remark: The library's extra target dependencies (e.g., `needs`) may write the module's source
+  (#16748), so the source is read for the import graph only after they finish. The import graph
+  (this facet, `transImports`, and the library's `modules`) is what the build of the library
+  reads first, so a generated module is found on a fresh checkout and its new text is the one
+  compiled. The `input` and `header` facets themselves do not wait, so a `needs` target may
+  read the headers of its own library's modules (e.g., to check their imports) without a cycle.
+  As a consequence, a `needs` target that fetches the `imports`, `transImports`, or `modules`
+  of its own library (or of a library whose `needs` depend on it) forms a dependency cycle,
+  which Lake reports as a build cycle when it finds it on the fetch stack and which otherwise
+  may never finish. Also, the `input` read by such a target (or by any other early fetch of
+  `input` or `header`) is the one the build uses, so a `needs` target that reads the header of
+  a module another `needs` target generates must depend on that target.
+
+  The continuation starts from an empty job state, so the `needs`' log and failure are not
+  repeated per module (their own jobs and `recFetchPreSetup` report them). It is a pure
+  projection (no cancellation check): the input may finish after a `--fail-fast` cancellation,
+  and module collection must still proceed so that the module jobs report it.
+  -/
+  let extraDepJob ← mod.lib.extraDep.fetch
+  SpawnM.ofFn fun fetch pkg? stack store ctx _ =>
+    Job.ofTask <$> BaseIO.bindTask (t := extraDepJob.task) (sync := true) fun _ => do
+      match (← (mod.input.fetch : FetchM _).toFn fetch pkg? stack store ctx {}) with
+      | .ok inputJob log =>
+        let sa : JobState := {log}
+        return inputJob.task.map (sync := true) fun
+          | .ok input s =>
+            let mods := input.imports.foldl (init := OrdModuleSet.empty) fun set imp =>
+              match imp.module? with | some mod => set.insert mod | none => set
+            .ok mods.toArray {sa.merge s with trace := s.trace}
+          | .error e s => .error ⟨log.size + e.val⟩ {sa.merge s with trace := s.trace}
+      | .error e log => return Task.pure (.error e {log})
 
 /-- The `ModuleFacetConfig` for the builtin `importsFacet`. -/
 public def Module.importsFacetConfig : ModuleFacetConfig importsFacet :=
