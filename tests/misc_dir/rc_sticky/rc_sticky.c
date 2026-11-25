@@ -172,27 +172,34 @@ static bool never_freed(lean_object * o) {
     return c == 0 || (c < 0 && (unsigned)c <= (unsigned)LEAN_RC_STICKY_DROP);
 }
 
-/* Never called: the closure of an unforced thunk only has to hold its argument. */
+/* Never called: a closure here only has to hold its argument. */
 static lean_object * unforced_fn(lean_object * a, lean_object * unit) {
     (void)unit;
     return a;
 }
 
-/* The kinds of object the walk of `lean_mark_persistent` enters, each holding `child`. */
+/* Kinds of object whose fields the walk of `lean_mark_persistent` follows, each holding `child`.
+   Promises and external objects are not among them: a promise needs a running task manager. */
 static lean_object * wrap_ctor(lean_object * child) { return box1(child); }
-static lean_object * wrap_forced_thunk(lean_object * child) { return lean_thunk_pure(child); }
-static lean_object * wrap_unforced_thunk(lean_object * child) {
+static lean_object * wrap_array(lean_object * child) {
+    return lean_array_push(lean_mk_empty_array_with_capacity(lean_box(1)), child);
+}
+static lean_object * wrap_closure(lean_object * child) {
     lean_object * c = lean_alloc_closure((void *)unforced_fn, 2, 1);
     lean_closure_set(c, 0, child);
-    return lean_mk_thunk(c);
+    return c;
 }
+static lean_object * wrap_forced_thunk(lean_object * child) { return lean_thunk_pure(child); }
+static lean_object * wrap_unforced_thunk(lean_object * child) { return lean_mk_thunk(wrap_closure(child)); }
 static lean_object * wrap_ref(lean_object * child) { return lean_st_mk_ref(child); }
 static lean_object * wrap_task(lean_object * child) { return lean_task_pure(child); }
 
 static lean_object * (* const g_wraps[])(lean_object *) = {
-    wrap_ctor, wrap_forced_thunk, wrap_unforced_thunk, wrap_ref, wrap_task,
+    wrap_ctor, wrap_array, wrap_closure, wrap_forced_thunk, wrap_unforced_thunk, wrap_ref, wrap_task,
 };
-static char const * const g_wrap_names[] = {"constructor", "forced thunk", "unforced thunk", "Ref", "task"};
+static char const * const g_wrap_names[] = {
+    "constructor", "array", "closure", "forced thunk", "unforced thunk", "Ref", "task",
+};
 #define NUM_WRAPS (sizeof(g_wraps) / sizeof(g_wraps[0]))
 
 #define CHECK_KIND(c, w) do { \
@@ -200,7 +207,7 @@ static char const * const g_wrap_names[] = {"constructor", "forced thunk", "unfo
                 g_failures++; } \
 } while (0)
 
-static const uint8_t g_wrap_tags[] = {0, LeanThunk, LeanThunk, LeanRef, LeanTask};
+static const uint8_t g_wrap_tags[] = {0, LeanArray, LeanClosure, LeanThunk, LeanThunk, LeanRef, LeanTask};
 
 /* An object of kind `w` that other threads hold (count -2), around a thread-shared leaf it owns. */
 static lean_object * shared_node(size_t w, lean_object ** inner) {
@@ -213,8 +220,8 @@ static lean_object * shared_node(size_t w, lean_object ** inner) {
 
 /* `lean_mark_persistent` on objects other threads hold, as `lean_obj_once_cold` does when a closed
    term's value was already shared before the term was first read: a thread-shared root, and a
-   thread-shared child of a single-threaded parent, of every kind the walk enters (a spawned task is
-   always thread-shared). An adjustment whose check passed before the marking applies its
+   thread-shared child of a single-threaded parent, of each kind above (a spawned task is always
+   thread-shared). An adjustment whose check passed before the marking applies its
    atomic update after it; a plain store of 0 turned that into a count of 1 or -1, which the next drop
    freed while the object was still referenced. The walk stops at such an object: what it points to
    stays alive through it, and is not read while other threads may update it (a thunk being forced, a
