@@ -609,6 +609,20 @@ extern "C" LEAN_EXPORT void lean_mark_persistent(object * o) {
         object * o = todo.back();
         todo.pop_back();
         if (!lean_is_scalar(o) && lean_has_rc(o)) {
+            if (!is_unshared(o)) {
+                // Other threads may hold `o` and adjust its count at any time: an adjustment that
+                // passed its check before a plain store of 0 still applies its atomic update after
+                // it, leaving a count of 1 or -1 that a later drop frees while `o` is still
+                // referenced (e.g. by a closed term, which `lean_obj_once_cold` marks after lazily
+                // initializing it on whichever thread gets there first). Freezing the count at
+                // `LEAN_RC_STICKY` instead leaves such late updates inside the never-freed range.
+                // What `o` points to stays alive through `o`, which is now never freed, so the walk
+                // stops here rather than read fields other threads may be updating (a thunk being
+                // forced, a `Ref` being set).
+                if (lean_is_unstuck_mt(o))
+                    std::atomic_store_explicit(lean_get_rc_mt_addr(o), LEAN_RC_STICKY, std::memory_order_relaxed);
+                continue;
+            }
             lean_internal_set_rc(o, 0);
 #if defined(__has_feature)
 #if __has_feature(address_sanitizer)

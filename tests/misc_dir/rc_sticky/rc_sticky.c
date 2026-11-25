@@ -161,8 +161,61 @@ static void test_mark_mt_skips_drifted_shared_counts(void) {
     release(o);
 }
 
+/* The atomic update of a thread-shared `lean_dec_ref` whose never-freed check passed before the count
+   moved. */
+static void stale_dec(lean_object * o) {
+    atomic_fetch_add_explicit(lean_get_rc_mt_addr(o), 1, memory_order_acq_rel);
+}
+
+static bool never_freed(lean_object * o) {
+    int c = rc(o);
+    return c == 0 || (c < 0 && (unsigned)c <= (unsigned)LEAN_RC_STICKY_DROP);
+}
+
+/* `lean_mark_persistent` on objects other threads hold, as `lean_obj_once_cold` does when a closed
+   term's value was already shared before the term was first read: a thread-shared root, and a
+   thread-shared child of a single-threaded parent. An adjustment whose check passed before the
+   marking applies its atomic update after it; a plain store of 0 turned that into a count of 1 or -1,
+   which the next drop freed while the object was still referenced. */
+static void test_mark_persistent_shared(void) {
+    for (int late_drop = 0; late_drop < 2; late_drop++) {
+        lean_object * grandchild = leaf(-1);
+        lean_object * root = box1(grandchild);
+        lean_internal_set_rc(root, -2);
+        lean_object * child = leaf(-2);
+        lean_object * parent = box1(child);
+        lean_mark_persistent(root);
+        lean_mark_persistent(parent);
+        CHECK_RC(parent, 0);
+        // The walk stops at a thread-shared object: what it points to stays alive through it.
+        CHECK_RC(grandchild, -1);
+        lean_object * shared[] = {root, child};
+        for (size_t i = 0; i < 2; i++) {
+            lean_object * o = shared[i];
+            if (late_drop) stale_dec(o); else stale_inc(o, LEAN_RC_INC_MAX);
+            CHECK(never_freed(o));
+            if (!never_freed(o)) continue;
+            lean_dec(o);
+            lean_inc(o);
+            lean_dec(o);
+            CHECK(never_freed(o));
+        }
+        release(parent);
+        release(child);
+        release(root);
+    }
+    // A single-threaded graph is still marked persistent throughout.
+    lean_object * child = leaf(1);
+    lean_object * parent = box1(child);
+    lean_mark_persistent(parent);
+    CHECK_RC(parent, 0);
+    CHECK_RC(child, 0);
+    release(parent);
+}
+
 int main(void) {
     lean_initialize_runtime_module();
+    test_mark_persistent_shared();
     test_drop_leaves_never_freed_counts();
     test_cascade_leaves_never_freed_counts();
     test_inc_leaves_frozen_counts();
